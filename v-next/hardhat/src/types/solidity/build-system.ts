@@ -19,7 +19,7 @@ export interface BuildOptions {
   buildProfile?: string;
 
   /**
-   * If `true`, this option allows the build process to merge compilation jobs
+   * If `false`, this option allows the build process to merge compilation jobs
    * if they have the same compiler version and settings.
    *
    * This is an useful optimization to be used when compiling a large number of
@@ -27,7 +27,7 @@ export interface BuildOptions {
    * together, block explorer verification processes trickier and/or with
    * unexpected results.
    */
-  mergeCompilationJobs?: boolean;
+  isolated?: boolean;
 
   /**
    * The number of concurrent compilation jobs to run.

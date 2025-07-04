@@ -239,6 +239,17 @@ describe.only("Partial compilation", () => {
           //   newArtifactsForACtimes.get(basename),
           // );
         }
+
+        // There should be 1 artifacts.d.ts file, not modified
+        const newTypeFileForAPath = path.join(
+          artifactsBasePath,
+          "A.sol",
+          "artifacts.d.ts",
+        );
+
+        const newTypeFileForACtime = (await stat(newTypeFileForAPath)).ctime;
+
+        // assert.equal(typeFileForACtime, newTypeFileForACtime); <<< FAILING
       });
     });
 

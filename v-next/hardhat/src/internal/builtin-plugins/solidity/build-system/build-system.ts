@@ -345,7 +345,7 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
     }
 
     if (
-      options?.mergeCompilationJobs ??
+      options?.isolated !== true &&
       shouldMergeCompilationJobs(buildProfileName)
     ) {
       log(`Merging compilation jobs`);
