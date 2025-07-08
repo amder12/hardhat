@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 
 import compile from "../../../../../src/internal/builtin-plugins/solidity/tasks/compile.js";
 import {
+  TestProject,
   TestProjectTemplate,
   useTestProjectTemplate,
 } from "./resolver/helpers.js";
@@ -10,258 +11,239 @@ import assert from "node:assert";
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { readdir, readFile, stat } from "node:fs/promises";
+import { HardhatRuntimeEnvironment } from "../../../../../src/types/hre.js";
+import { getAllFilesMatching } from "@nomicfoundation/hardhat-utils/fs";
 
-// Test Scenarios
-//   - Compiling a project from scratch
-//     - Project with one file
-//     - Project with two independent files
-//       - Non-isolated
-//       - Isolated
-//     - Project with two connected files
-//       - Non-isolated
-//       - Isolated
-//     - Project with three files (A -> B -> C)
-//       - Non-isolated
-//       - Isolated
-//     - Project with three files (A -> B <- C)
-//       - Non-isolated
-//       - Isolated
-//     - Project with three files (A -> B, C)
-//       - Non-isolated
-//       - Isolated
-//   - Modifications to a one-file project
-//     - Modify a file
-//     - Add a file, then modify both
-//       - Non-isolated
-//       - Isolated
-//     - Remove the file
-//     - Add a dependency
-//       - Non-isolated
-//       - Isolated
-//     - Add a dependant
-//       - Non-isolated
-//       - Isolated
-//   - Modifications to a project with two independent files
-//     - Modify one file
-//       - Non-isolated
-//       - Isolated
-//     - Delete one file, then modify the remaining file
-//       - Non-isolated
-//       - Isolated
-//   - Modifications to a project with two connected files
-//     - Modify the dependency
-//       - Non-isolated
-//       - Isolated
-//     - Modify the dependant
-//       - Non-isolated
-//       - Isolated
-//     - Remove the dependency
-//       - Non-isolated
-//       - Isolated
-//     - Remove the dependant
-//       - Non-isolated
-//       - Isolated
-//   - Modifications to a project with three files (A -> B -> C)
-//     - Modify the deepest dependency
-//       - Non-isolated
-//       - Isolated
-//     - Modify the file in the middle
-//       - Non-isolated
-//       - Isolated
-//     - Modify the bottom dependant
-//       - Non-isolated
-//       - Isolated
-//     - Delete the top dependency
-//       - Non-isolated
-//       - Isolated
-//     - Delete the file in the middle
-//       - Non-isolated
-//       - Isolated
-//     - Delete the bottom dependant
-//       - Non-isolated
-//       - Isolated
-//   - Modifications to a project with three files (A -> B <- C)
-//     - Modify the dependency
-//       - Non-isolated
-//       - Isolated
-//     - Modify one of the dependants
-//       - Non-isolated
-//       - Isolated
-//     - Delete the dependency
-//       - Non-isolated
-//       - Isolated
-//     - Delete one of the dependants
-//       - Non-isolated
-//       - Isolated
-//   - Modifications to a project with three files (A -> B, C)
-//     - Modify the dependency
-//       - Non-isolated
-//       - Isolated
-//     - Modify the dependant
-//       - Non-isolated
-//       - Isolated
-//     - Modify the independent file
-//       - Non-isolated
-//       - Isolated
-//     - Delete the dependency
-//       - Non-isolated
-//       - Isolated
-//     - Delete the dependant
-//       - Non-isolated
-//       - Isolated
-//     - Delete the independent file
-//       - Non-isolated
-//       - Isolated
-//   - Compiling subsets of files
-//     - Compile a single file in a project with one file
-//     - Compile a single file in a project with thwo independent files
-//       - Non-isolated
-//       - Isolated
+async function getHRE(project: TestProject) {
+  return createHardhatRuntimeEnvironment({}, {}, project.path);
+}
+
+interface FileDetail {
+  path: string;
+  modificationTime: Date;
+}
+
+class TestProjectWrapper {
+  constructor(
+    public project: TestProject,
+    public hre: HardhatRuntimeEnvironment,
+  ) {}
+
+  async compile(options: any = {}) {
+    await this.hre.tasks.getTask(["compile"]).run({ ...options, quiet: true });
+  }
+
+  async getSnapshot() {
+    const buildInfos = await this.getBuildInfoFiles();
+    const artifacts = await this.getArtifacts();
+    const typeFiles = await this.getTypefiles();
+
+    const buildIdReferences = await this.getBuildIdReferences(artifacts);
+    // const modificationTimes = await this.getModificationTimes();
+
+    return {
+      buildInfos,
+      artifacts,
+      typeFiles,
+      buildIdReferences,
+      // modifiedTime: { "/path/A.json": "date" },
+    };
+  }
+
+  buildInfosBasePath() {
+    return path.join(this.project.path, "artifacts", "build-info");
+  }
+
+  artifactsBasePath() {
+    return path.join(this.project.path, "artifacts", "contracts");
+  }
+
+  async getBuildInfoFiles() {
+    const filePaths = (await readdir(this.buildInfosBasePath()))
+      .filter((filePath) => !filePath.endsWith(".output.json"))
+      .map((basename) => path.join(this.buildInfosBasePath(), basename));
+
+    return Promise.all(
+      filePaths.map(async (filePath) => ({
+        path: filePath,
+        modificationTime: await this.getModificationTime(filePath),
+        buildId: path.basename(filePath).replace(".json", ""),
+      })),
+    );
+  }
+
+  async getModificationTime(filePath: string) {
+    return (await stat(filePath)).ctime;
+  }
+
+  async getArtifactFolders() {
+    return readdir(this.artifactsBasePath());
+  }
+
+  async getArtifacts() {
+    const artifacts: Record<string, FileDetail[]> = {};
+
+    const artifactPaths = await getAllFilesMatching(
+      this.artifactsBasePath(),
+      (path) => path.endsWith(".json"),
+    );
+
+    for (const artifactPath of artifactPaths) {
+      const sourceName = artifactPath
+        .replace(`${this.artifactsBasePath() + path.sep}`, "")
+        .replace(`${path.sep + path.basename(artifactPath)}`, "");
+
+      artifacts[sourceName] ??= [];
+      artifacts[sourceName].push({
+        path: artifactPath,
+        modificationTime: await this.getModificationTime(artifactPath),
+      });
+    }
+
+    return artifacts;
+  }
+
+  async getTypefiles() {
+    const typefiles: Record<string, FileDetail> = {};
+
+    const typefilePaths = await getAllFilesMatching(
+      this.artifactsBasePath(),
+      (path) => path.endsWith("artifacts.d.ts"),
+    );
+
+    for (const typefilePath of typefilePaths) {
+      const sourceName = this.getSourcenameFromArtifactPath(typefilePath);
+      typefiles[sourceName] = {
+        path: typefilePath,
+        modificationTime: await this.getModificationTime(typefilePath),
+      };
+    }
+
+    return typefiles;
+  }
+
+  async getBuildIdReferences(artifacts: Record<string, FileDetail[]>) {
+    const buildIdReferences: Record<string, string> = {};
+
+    const artifactPaths = Object.values(artifacts)
+      .flat()
+      .map((f) => f.path);
+
+    for (const artifactPath of artifactPaths) {
+      const artifactContent = (await readFile(artifactPath)).toString();
+      const artifact = JSON.parse(artifactContent);
+      buildIdReferences[artifactPath] = artifact.buildInfoId;
+    }
+
+    return buildIdReferences;
+  }
+
+  getSourcenameFromArtifactPath(artifactPath: string) {
+    return artifactPath
+      .replace(`${this.artifactsBasePath() + path.sep}`, "")
+      .replace(`${path.sep + path.basename(artifactPath)}`, "");
+  }
+}
 
 describe.only("Partial compilation", () => {
   describe("Compiling a project from scratch", () => {
-    describe("Project with one file", () => {
-      it("should create a build info file, generate the artifact file associated to it, and generate the TS artifacts", async () => {
-        const projectTemplate: TestProjectTemplate = {
-          name: "test",
-          version: "1.0.0",
-          files: {
-            "contracts/A.sol": `contract A {} contract A2 {}`,
-          },
-        };
-        await using project = await useTestProjectTemplate(projectTemplate);
-        const hre = await createHardhatRuntimeEnvironment({}, {}, project.path);
+    describe("Project with two independent files", () => {
+      describe("Non-isolated", () => {
+        it("artifacts from both files should point to a single build info", async () => {
+          await using _project = await useTestProjectTemplate({
+            name: "test",
+            version: "1.0.0",
+            files: {
+              "contracts/A.sol": `contract A {} contract A2 {}`,
+              "contracts/B.sol": `contract B {} contract B2 {}`,
+            },
+          });
+          const hre = await getHRE(_project);
+          const project = new TestProjectWrapper(_project, hre);
 
-        // Compile first time
-        await hre.tasks.getTask(["compile"]).run({ quiet: true });
+          // Compile first time
+          await project.compile();
 
-        const buildInfosBasePath = path.join(
-          project.path,
-          "artifacts",
-          "build-info",
-        );
-        // There should be only 1 build info including A
-        const buildInfoFiles = (await readdir(buildInfosBasePath)).filter(
-          (filePath) => !filePath.endsWith(".output.json"),
-        );
+          const firstSnapshot = await project.getSnapshot();
+          const { buildInfos, artifacts, typeFiles, buildIdReferences } =
+            firstSnapshot;
 
-        assert.equal(buildInfoFiles.length, 1);
+          // There should be only 1 build info including A and B
+          assert.equal(buildInfos.length, 1);
+          const [buildInfo] = buildInfos;
 
-        const [buildInfoBasename] = buildInfoFiles;
-        const buildId = buildInfoBasename.replace(".json", "");
-        const buildInfoCtime = (
-          await stat(path.join(buildInfosBasePath, buildInfoBasename))
-        ).ctime;
+          // There should be 2 artifact folders and 2 artifacts each
+          assert.equal(artifacts["A.sol"].length, 2);
+          assert.equal(artifacts["B.sol"].length, 2);
 
-        const artifactsBasePath = path.join(
-          project.path,
-          "artifacts",
-          "contracts",
-        );
+          // All artifacts should point to the single build info
+          for (const artifact of artifacts["A.sol"]) {
+            assert.equal(buildIdReferences[artifact.path], buildInfo.buildId);
+          }
+          for (const artifact of artifacts["B.sol"]) {
+            assert.equal(buildIdReferences[artifact.path], buildInfo.buildId);
+          }
 
-        // There should be 1 artifact folder
-        const artifactFolders = await readdir(artifactsBasePath);
-        assert.deepEqual(artifactFolders, ["A.sol"]);
+          // There should be 1 type definition file per source file
+          assert.ok(typeFiles["A.sol"] !== undefined);
+          assert.ok(typeFiles["B.sol"] !== undefined);
 
-        // The artifact folder should have the json artifacts for the 2 contracts defined in the source file, and the declaration file
-        const artifactsForA = (
-          await readdir(path.join(artifactsBasePath, "A.sol"))
-        ).filter((basename) => basename.endsWith(".json"));
+          // Recompile
+          await project.compile();
 
-        assert.deepEqual(artifactsForA, ["A.json", "A2.json"]);
+          const secondSnapshot = await project.getSnapshot();
 
-        const artifactsForACtimes = new Map<string, Date>();
+          // Nothing in the snapshot should have changed
+          assert.deepEqual(firstSnapshot, secondSnapshot);
+        });
+      });
 
-        // The artifacts for A.sol should point to the build info
-        for (const basename of artifactsForA) {
-          const artifactPath = path.join(artifactsBasePath, "A.sol", basename);
-          const artifactContent = (await readFile(artifactPath)).toString();
-          const artifact = JSON.parse(artifactContent);
-          const artifactCtime = (await stat(artifactPath)).ctime;
-          artifactsForACtimes.set(basename, artifactCtime);
+      describe("Isolated", () => {
+        it("artifacts from each file should point to its individual build info", async () => {
+          await using _project = await useTestProjectTemplate({
+            name: "test",
+            version: "1.0.0",
+            files: {
+              "contracts/A.sol": `contract A {} contract A2 {}`,
+              "contracts/B.sol": `contract B {} contract B2 {}`,
+            },
+          });
+          const hre = await getHRE(_project);
+          const project = new TestProjectWrapper(_project, hre);
 
-          assert.equal(
-            artifact.buildInfoId,
-            buildId,
-            `Build id from file ${artifactPath} expected to be ${buildId} but was ${artifact.buildInfoId}`,
-          );
-        }
+          // Compile first time
+          await project.compile({ isolated: true });
 
-        // There should be the type definition file
-        const typeFileForAPath = path.join(
-          artifactsBasePath,
-          "A.sol",
-          "artifacts.d.ts",
-        );
+          const firstSnapshot = await project.getSnapshot();
+          const { buildInfos, artifacts, typeFiles, buildIdReferences } =
+            firstSnapshot;
 
-        const typeFileForACtime = (await stat(typeFileForAPath)).ctime;
+          // There should be 2 build infos
+          assert.equal(buildInfos.length, 2);
 
-        // Recompile
-        await hre.tasks.getTask(["compile"]).run({ quiet: true });
+          // There should be 2 artifact folders and 2 artifacts each
+          assert.equal(artifacts["A.sol"].length, 2);
+          assert.equal(artifacts["B.sol"].length, 2);
 
-        // There should still be only 1 build info file and it should have not been modified
-        const newBuildInfoFiles = (await readdir(buildInfosBasePath)).filter(
-          (filePath) => !filePath.endsWith(".output.json"),
-        );
+          // Artifacts from A should point to a build info and artifacts from B to a different one
+          const buildInfoA = buildIdReferences[artifacts["A.sol"][0].path];
+          const buildInfoB = buildIdReferences[artifacts["B.sol"][0].path];
+          assert.notEqual(buildInfoA, buildInfoB);
 
-        assert.equal(newBuildInfoFiles.length, 1);
+          // There should be 1 type definition file per source file
+          assert.ok(typeFiles["A.sol"] !== undefined);
+          assert.ok(typeFiles["B.sol"] !== undefined);
 
-        const [newBuildInfoBasename] = newBuildInfoFiles;
+          // Recompile
+          await project.compile();
 
-        assert.equal(newBuildInfoBasename, buildInfoBasename);
+          const secondSnapshot = await project.getSnapshot();
 
-        const newBuildInfoCtime = (
-          await stat(path.join(buildInfosBasePath, newBuildInfoBasename))
-        ).ctime;
-
-        // assert.equal(newBuildInfoCtime, buildInfoCtime); // <<<<<< FAILING
-
-        // There should be the same two generated json artifacts, without being modified
-
-        const newArtifactsForA = (
-          await readdir(path.join(artifactsBasePath, "A.sol"))
-        ).filter((basename) => basename.endsWith(".json"));
-
-        assert.deepEqual(newArtifactsForA, artifactsForA);
-
-        const newArtifactsForACtimes = new Map<string, Date>();
-
-        for (const basename of newArtifactsForA) {
-          const artifactPath = path.join(artifactsBasePath, "A.sol", basename);
-          const artifactCtime = (await stat(artifactPath)).ctime;
-          newArtifactsForACtimes.set(basename, artifactCtime);
-        }
-
-        for (const basename of artifactsForA) {
-          assert.notEqual(artifactsForACtimes.get(basename), undefined);
-          // assert.equal( // <<<< FAILING
-          //   artifactsForACtimes.get(basename),
-          //   newArtifactsForACtimes.get(basename),
-          // );
-        }
-
-        // There should be 1 artifacts.d.ts file, not modified
-        const newTypeFileForAPath = path.join(
-          artifactsBasePath,
-          "A.sol",
-          "artifacts.d.ts",
-        );
-
-        const newTypeFileForACtime = (await stat(newTypeFileForAPath)).ctime;
-
-        // assert.equal(typeFileForACtime, newTypeFileForACtime); <<< FAILING
+          // Nothing in the snapshot should have changed
+          assert.deepEqual(firstSnapshot, secondSnapshot);
+        });
       });
     });
-
-    // describe("Project with two independent files", () => {
-    //   describe("Non-isolated", () => {
-    //     it("should (...)", async () => {});
-    //   });
-
-    //   describe("Isolated", () => {
-    //     it("should (...)", async () => {});
-    //   });
-    // });
 
     // describe("Project with two connected files", () => {
     //   describe("Non-isolated", () => {

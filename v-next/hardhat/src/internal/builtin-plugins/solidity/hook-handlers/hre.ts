@@ -8,6 +8,7 @@ import type {
   CompileBuildInfoOptions,
   FileBuildResult,
   GetCompilationJobsOptions,
+  GetCompilationJobsResult,
   RunCompilationJobOptions,
   SolidityBuildSystem,
 } from "../../../../types/solidity/build-system.js";
@@ -46,7 +47,7 @@ class LazySolidityBuildSystem implements SolidityBuildSystem {
   public async getCompilationJobs(
     rootFiles: string[],
     options?: GetCompilationJobsOptions,
-  ): Promise<CompilationJobCreationError | Map<string, CompilationJob>> {
+  ): Promise<CompilationJobCreationError | GetCompilationJobsResult> {
     const buildSystem = await this.#getBuildSystem();
     return buildSystem.getCompilationJobs(rootFiles, options);
   }

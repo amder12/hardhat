@@ -165,6 +165,11 @@ export interface FailedFileBuildResult {
   errors: CompilerOutputError[];
 }
 
+export interface GetCompilationJobsResult {
+  compilationJobsPerFile: Map<string, CompilationJob>;
+  indexedIndividualJobs: Map<string, CompilationJob>;
+}
+
 /**
  * The Solidity build system.
  */
@@ -209,7 +214,7 @@ export interface SolidityBuildSystem {
   getCompilationJobs(
     rootFilePaths: string[],
     options?: GetCompilationJobsOptions,
-  ): Promise<CompilationJobCreationError | Map<string, CompilationJob>>;
+  ): Promise<CompilationJobCreationError | GetCompilationJobsResult>;
 
   /**
    * Returns the output of running the given compilation job.

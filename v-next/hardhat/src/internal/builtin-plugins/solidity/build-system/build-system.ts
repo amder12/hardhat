@@ -10,13 +10,17 @@ import type {
   GetCompilationJobsOptions,
   CompileBuildInfoOptions,
   RunCompilationJobOptions,
+  GetCompilationJobsResult,
 } from "../../../../types/solidity/build-system.js";
 import type { CompilationJob } from "../../../../types/solidity/compilation-job.js";
 import type {
   CompilerOutput,
   CompilerOutputError,
 } from "../../../../types/solidity/compiler-io.js";
-import type { SolidityBuildInfo } from "../../../../types/solidity.js";
+import type {
+  DependencyGraph,
+  SolidityBuildInfo,
+} from "../../../../types/solidity.js";
 
 import os from "node:os";
 import path from "node:path";
@@ -85,17 +89,17 @@ export interface SolidityBuildSystemOptions {
 export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
   readonly #hooks: HookManager;
   readonly #options: SolidityBuildSystemOptions;
-  readonly #compilerOutputCache: ObjectCache<CompilerOutput>;
+  readonly #compilerOutputCache: ObjectCache<boolean>;
   readonly #defaultConcurrency = Math.max(os.cpus().length - 1, 1);
   #downloadedCompilers = false;
 
   constructor(hooks: HookManager, options: SolidityBuildSystemOptions) {
     this.#hooks = hooks;
     this.#options = options;
-    this.#compilerOutputCache = new ObjectCache<CompilerOutput>(
+    this.#compilerOutputCache = new ObjectCache<boolean>(
       options.cachePath,
       "compiler-output",
-      "v1",
+      "v2",
     );
   }
 
@@ -129,16 +133,21 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
 
     await this.#downloadConfiguredCompilers(options?.quiet);
 
-    const compilationJobsPerFile = await this.getCompilationJobs(
+    const compilationJobsResult = await this.getCompilationJobs(
       rootFilePaths,
       options,
     );
 
-    if (!(compilationJobsPerFile instanceof Map)) {
-      return compilationJobsPerFile;
+    if ("reason" in compilationJobsResult) {
+      return compilationJobsResult;
     }
 
+    const { compilationJobsPerFile, indexedIndividualJobs } =
+      compilationJobsResult;
+
     const compilationJobs = [...new Set(compilationJobsPerFile.values())];
+
+    console.log(`Compilation job count: ${compilationJobs.length}`);
 
     // NOTE: We precompute the build ids in parallel here, which are cached
     // internally in each compilation job
@@ -156,18 +165,20 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       async (compilationJob) => {
         const buildId = await compilationJob.getBuildId();
 
-        if (options?.force !== true) {
-          const cachedCompilerOutput =
-            await this.#compilerOutputCache.get(buildId);
-          if (cachedCompilerOutput !== undefined) {
-            log(`Using cached compiler output for build ${buildId}`);
-            return {
-              compilationJob,
-              compilerOutput: cachedCompilerOutput,
-              cached: true,
-            };
-          }
-        }
+        // if (options?.force !== true) {
+        //   const cachedCompilerOutput =
+        //     await this.#compilerOutputCache.get(buildId);
+        //   if (cachedCompilerOutput !== undefined) {
+        //     console.log(`Using cached compiler output for build ${buildId}`);
+        //     return {
+        //       compilationJob,
+        //       compilerOutput: cachedCompilerOutput,
+        //       cached: true,
+        //     };
+        //   }
+        // }
+
+        console.log(`Running compilation job for build ${buildId}`);
 
         const compilerOutput = await this.runCompilationJob(
           compilationJob,
@@ -193,9 +204,9 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       (result) => !this.#hasCompilationErrors(result.compilerOutput),
     );
 
-    const cachingCompilationResults = this.#cacheCompilationResults(
-      uncachedSuccessfulResults,
-    );
+    // const cachingCompilationResults = this.#cacheCompilationResults(
+    //   uncachedSuccessfulResults,
+    // );
 
     const isSuccessfulBuild =
       uncachedResults.length === uncachedSuccessfulResults.length;
@@ -218,6 +229,30 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
             result.compilationJob,
             artifactsPerFile,
           );
+        }),
+      );
+
+      log("Caching root files");
+      await Promise.all(
+        results.map(async (result) => {
+          const roots = Array.from(
+            result.compilationJob.dependencyGraph.getRoots().keys(),
+          );
+
+          return roots.map(async (root) => {
+            const individualJob = indexedIndividualJobs.get(root);
+
+            assertHardhatInvariant(
+              individualJob !== undefined,
+              "Failed to get individual job from compiled job",
+            );
+
+            const key = `${root}-${await individualJob.getBuildId()}`;
+
+            console.log(`Setting ${key}`);
+
+            return this.#compilerOutputCache.set(key, true);
+          });
         }),
       );
     }
@@ -288,7 +323,7 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
     }
 
     // We wait for the compilation results to be cached before returning
-    await cachingCompilationResults;
+    // await cachingCompilationResults;
 
     return resultsMap;
   }
@@ -296,7 +331,7 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
   public async getCompilationJobs(
     rootFilePaths: string[],
     options?: GetCompilationJobsOptions,
-  ): Promise<CompilationJobCreationError | Map<string, CompilationJob>> {
+  ): Promise<CompilationJobCreationError | GetCompilationJobsResult> {
     await this.#downloadConfiguredCompilers(options?.quiet);
 
     const dependencyGraph = await buildDependencyGraph(
@@ -344,10 +379,65 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       subgraphsWithConfig.push([configOrError, subgraph]);
     }
 
+    // build version => longVersion map
+    const solcVersionToLongVersion = new Map<string, string>();
+    for (const [solcConfig] of subgraphsWithConfig) {
+      let solcLongVersion = solcVersionToLongVersion.get(solcConfig.version);
+
+      if (solcLongVersion === undefined) {
+        const compiler = await getCompiler(solcConfig.version);
+        solcLongVersion = compiler.longVersion;
+        solcVersionToLongVersion.set(solcConfig.version, solcLongVersion);
+      }
+    }
+
+    // build job for each root file. At this point subgraphsWithConfig are 1 root file each
+    const indexedIndividualJobs: Map<string, CompilationJob> = new Map();
+    await Promise.all(
+      subgraphsWithConfig.map(async ([config, subgraph]) => {
+        const solcLongVersion = solcVersionToLongVersion.get(config.version);
+
+        assertHardhatInvariant(
+          solcLongVersion !== undefined,
+          "solcLongVersion should not be undefined",
+        );
+
+        const compilationJob = new CompilationJobImplementation(
+          subgraph,
+          config,
+          solcLongVersion,
+          this.#hooks,
+        );
+
+        await compilationJob.getBuildId(); // precompute
+
+        assertHardhatInvariant(
+          subgraph.getRoots().size === 1,
+          "individual subgraph doesnt have exactly 1 root file",
+        );
+
+        const rootFilePath = Array.from(subgraph.getRoots().keys())[0];
+
+        indexedIndividualJobs.set(rootFilePath, compilationJob);
+      }),
+    );
+
+    // Select which files to compile
+    const rootFilesToCompile: Set<string> = new Set();
+
+    for (const [rootFile, compilationJob] of indexedIndividualJobs.entries()) {
+      const cacheKey = `${rootFile}-${await compilationJob.getBuildId()}`;
+      const cacheResult = await this.#compilerOutputCache.get(cacheKey);
+      if (cacheResult === undefined) {
+        rootFilesToCompile.add(rootFile);
+      }
+    }
+
     if (
       options?.isolated !== true &&
       shouldMergeCompilationJobs(buildProfileName)
     ) {
+      // non-isolated mode
       log(`Merging compilation jobs`);
 
       const mergedSubgraphsByConfig: Map<
@@ -358,33 +448,50 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       // Note: This groups the subgraphs by solc config. It compares the configs
       // based on reference, and not by deep equality. It misses some merging
       // opportunities, but this is Hardhat v2's behavior and works well enough.
-      for (const [solcConfig, subgraph] of subgraphsWithConfig) {
-        const mergedSubgraph = mergedSubgraphsByConfig.get(solcConfig);
+      for (const [config, subgraph] of subgraphsWithConfig) {
+        assertHardhatInvariant(
+          subgraph.getRoots().size === 1,
+          "there should be only 1 root file on subgraph",
+        );
+
+        const rootFile = Array.from(subgraph.getRoots().keys())[0];
+
+        // Skip root files with cache hit (should not recompile)
+        if (!rootFilesToCompile.has(rootFile)) {
+          continue;
+        }
+
+        const mergedSubgraph = mergedSubgraphsByConfig.get(config);
 
         if (mergedSubgraph === undefined) {
-          mergedSubgraphsByConfig.set(solcConfig, subgraph);
+          mergedSubgraphsByConfig.set(config, subgraph);
         } else {
-          mergedSubgraphsByConfig.set(
-            solcConfig,
-            mergedSubgraph.merge(subgraph),
-          );
+          mergedSubgraphsByConfig.set(config, mergedSubgraph.merge(subgraph));
         }
       }
 
       subgraphsWithConfig = [...mergedSubgraphsByConfig.entries()];
-    }
+    } else {
+      subgraphsWithConfig = subgraphsWithConfig.filter(([config, subgraph]) => {
+        assertHardhatInvariant(
+          subgraph.getRoots().size === 1,
+          "there should be only 1 root file on subgraph",
+        );
 
-    const solcVersionToLongVersion = new Map<string, string>();
+        const rootFile = Array.from(subgraph.getRoots().keys())[0];
+
+        return rootFilesToCompile.has(rootFile);
+      });
+    }
 
     const compilationJobsPerFile = new Map<string, CompilationJob>();
     for (const [solcConfig, subgraph] of subgraphsWithConfig) {
-      let solcLongVersion = solcVersionToLongVersion.get(solcConfig.version);
+      const solcLongVersion = solcVersionToLongVersion.get(solcConfig.version);
 
-      if (solcLongVersion === undefined) {
-        const compiler = await getCompiler(solcConfig.version);
-        solcLongVersion = compiler.longVersion;
-        solcVersionToLongVersion.set(solcConfig.version, solcLongVersion);
-      }
+      assertHardhatInvariant(
+        solcLongVersion !== undefined,
+        "solcLongVersion should not be undefined",
+      );
 
       const compilationJob = new CompilationJobImplementation(
         subgraph,
@@ -401,7 +508,7 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       }
     }
 
-    return compilationJobsPerFile;
+    return { compilationJobsPerFile, indexedIndividualJobs };
   }
 
   public async runCompilationJob(
@@ -491,6 +598,8 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
 
       // If the folder exists, we remove it first, as we don't want to leave
       // any old artifacts there.
+      console.log(`Removing artifacts folder ${fileFolder}`);
+
       await remove(fileFolder);
 
       const contracts = compilerOutput.contracts?.[root.inputSourceName];
@@ -514,6 +623,8 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
             userSourceNameMap,
           );
 
+          console.log(`Writing artifact ${contractArtifactPath}`);
+
           await writeUtf8File(
             contractArtifactPath,
             JSON.stringify(artifact, undefined, 2),
@@ -529,6 +640,9 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       const artifactsDeclarationFilePath = path.join(
         fileFolder,
         "artifacts.d.ts",
+      );
+      console.log(
+        `Writing artifacts declaration file ${artifactsDeclarationFilePath}`,
       );
 
       const artifactsDeclarationFile = getArtifactsDeclarationFile(artifacts);
@@ -563,6 +677,8 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
 
         // TODO: Maybe formatting the build info is slow, but it's mostly
         // strings, so it probably shouldn't be a problem.
+        console.log(`Writing build info ${buildInfoPath}`);
+
         await writeJsonFile(buildInfoPath, buildInfo);
       })(),
       (async () => {
@@ -576,6 +692,8 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
         // TODO: Earlier in the build process, very similar files are created on disk by the
         // Compiler.  Instead of creating them again, we should consider copying/moving them.
         // This would require changing the format of the build info output file.
+        console.log(`Writing build info output ${buildInfoOutputPath}`);
+
         await writeJsonFileAsStream(buildInfoOutputPath, buildInfoOutput);
       })(),
     ]);
@@ -602,6 +720,8 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       const relativePath = path.relative(this.#options.artifactsPath, file);
 
       if (!userSourceNamesSet.has(relativePath)) {
+        console.log(`Removing artifacts directory ${file}`);
+
         await remove(file);
       }
     }
@@ -643,6 +763,8 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       const id = basename.substring(0, basename.indexOf("."));
 
       if (!reachableBuildInfoIdsSet.has(id)) {
+        console.log(`Removing build info file ${buildInfoFile}`);
+
         await remove(buildInfoFile);
       }
     }
@@ -756,16 +878,20 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
   #cacheCompilationResults(
     compilationResults: CompilationResult[],
   ): Promise<void> {
-    return Promise.all(
-      compilationResults.map(async (result) => {
-        return this.#compilerOutputCache.set(
-          await result.compilationJob.getBuildId(),
-          result.compilerOutput,
-        );
-      }),
-    ).then(() => {
-      return this.#compilerOutputCache.clean();
-    });
+    // return Promise.all(
+    // compilationResults.map(async (result) => {
+    //   console.log(
+    //     `Caching compiler output for build ${await result.compilationJob.getBuildId()}`,
+    //   );
+
+    //   return this.#compilerOutputCache.set(
+    //     await result.compilationJob.getBuildId(),
+    //     result.compilerOutput,
+    //   );
+    // }),
+    // ).then(() => {
+    return this.#compilerOutputCache.clean();
+    // });
   }
 
   #printSolcErrorsAndWarnings(errors?: CompilerOutputError[]): void {
