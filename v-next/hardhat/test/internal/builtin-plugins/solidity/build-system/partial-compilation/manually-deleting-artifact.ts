@@ -5,7 +5,7 @@ import { useTestProjectTemplate } from "../resolver/helpers.js";
 import { getHRE, TestProjectWrapper } from "./helpers.js";
 import { rm } from "node:fs/promises";
 
-describe.only("Partial compilation", () => {
+describe("Partial compilation", () => {
   describe("Recompiling when an artifact has been manually deleted in between", () => {
     it("recompiles and regenerates artifacts", async () => {
       await using _project = await useTestProjectTemplate({
