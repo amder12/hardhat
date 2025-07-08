@@ -6,6 +6,7 @@ import type {
   BuildOptions,
   CompilationJobCreationError,
   CompileBuildInfoOptions,
+  EmitArtifactsResult,
   FileBuildResult,
   GetCompilationJobsOptions,
   GetCompilationJobsResult,
@@ -76,7 +77,7 @@ class LazySolidityBuildSystem implements SolidityBuildSystem {
   public async emitArtifacts(
     compilationJob: CompilationJob,
     compilerOutput: CompilerOutput,
-  ): Promise<ReadonlyMap<string, string[]>> {
+  ): Promise<EmitArtifactsResult> {
     const buildSystem = await this.#getBuildSystem();
     return buildSystem.emitArtifacts(compilationJob, compilerOutput);
   }

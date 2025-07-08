@@ -170,6 +170,13 @@ export interface GetCompilationJobsResult {
   indexedIndividualJobs: Map<string, CompilationJob>;
 }
 
+export interface EmitArtifactsResult {
+  artifactsPerFile: ReadonlyMap<string, string[]>;
+  buildInfoPath: string;
+  typeFilePaths: Map<string, string>;
+  buildInfoOutputPath: string;
+}
+
 /**
  * The Solidity build system.
  */
@@ -258,7 +265,7 @@ export interface SolidityBuildSystem {
   emitArtifacts(
     compilationJob: CompilationJob,
     compilerOutput: CompilerOutput,
-  ): Promise<ReadonlyMap<string, string[]>>;
+  ): Promise<EmitArtifactsResult>;
 
   /**
    * Analyzes the project and cleans up the artifacts by:

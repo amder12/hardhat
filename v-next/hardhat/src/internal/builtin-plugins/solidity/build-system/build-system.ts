@@ -11,6 +11,7 @@ import type {
   CompileBuildInfoOptions,
   RunCompilationJobOptions,
   GetCompilationJobsResult,
+  EmitArtifactsResult,
 } from "../../../../types/solidity/build-system.js";
 import type { CompilationJob } from "../../../../types/solidity/compilation-job.js";
 import type {
@@ -30,6 +31,7 @@ import {
   HardhatError,
 } from "@nomicfoundation/hardhat-errors";
 import {
+  exists,
   getAllDirectoriesMatching,
   getAllFilesMatching,
   readJsonFile,
@@ -86,17 +88,24 @@ export interface SolidityBuildSystemOptions {
   readonly cachePath: string;
 }
 
+export interface RootFileCacheEntry {
+  buildInfoPath: string;
+  buildInfoOutputPath: string;
+  artifactPaths: string[];
+  typeFilePath: string;
+}
+
 export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
   readonly #hooks: HookManager;
   readonly #options: SolidityBuildSystemOptions;
-  readonly #compilerOutputCache: ObjectCache<boolean>;
+  readonly #compilerOutputCache: ObjectCache<RootFileCacheEntry>;
   readonly #defaultConcurrency = Math.max(os.cpus().length - 1, 1);
   #downloadedCompilers = false;
 
   constructor(hooks: HookManager, options: SolidityBuildSystemOptions) {
     this.#hooks = hooks;
     this.#options = options;
-    this.#compilerOutputCache = new ObjectCache<boolean>(
+    this.#compilerOutputCache = new ObjectCache<RootFileCacheEntry>(
       options.cachePath,
       "compiler-output",
       "v2",
@@ -219,42 +228,29 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
     if (isSuccessfulBuild) {
       log("Emitting artifacts of successful build");
       await Promise.all(
-        results.map(async (result) => {
-          const artifactsPerFile = await this.emitArtifacts(
-            result.compilationJob,
-            result.compilerOutput,
+        results.map(async (compilationResult) => {
+          const emitArtifactsResult = await this.emitArtifacts(
+            compilationResult.compilationJob,
+            compilationResult.compilerOutput,
           );
+
+          const { artifactsPerFile } = emitArtifactsResult;
 
           contractArtifactsGeneratedByCompilationJob.set(
-            result.compilationJob,
+            compilationResult.compilationJob,
             artifactsPerFile,
           );
-        }),
-      );
 
-      log("Caching root files");
-      await Promise.all(
-        results.map(async (result) => {
-          const roots = Array.from(
-            result.compilationJob.dependencyGraph.getRoots().keys(),
+          // Cache the results
+          await this.#cacheCompilationResult(
+            indexedIndividualJobs,
+            compilationResult,
+            emitArtifactsResult,
           );
-
-          return roots.map(async (root) => {
-            const individualJob = indexedIndividualJobs.get(root);
-
-            assertHardhatInvariant(
-              individualJob !== undefined,
-              "Failed to get individual job from compiled job",
-            );
-
-            const key = `${root}-${await individualJob.getBuildId()}`;
-
-            console.log(`Setting ${key}`);
-
-            return this.#compilerOutputCache.set(key, true);
-          });
         }),
       );
+
+      await this.#compilerOutputCache.clean();
     }
 
     const resultsMap: Map<string, FileBuildResult> = new Map();
@@ -428,8 +424,29 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
     for (const [rootFile, compilationJob] of indexedIndividualJobs.entries()) {
       const cacheKey = `${rootFile}-${await compilationJob.getBuildId()}`;
       const cacheResult = await this.#compilerOutputCache.get(cacheKey);
+
       if (cacheResult === undefined) {
         rootFilesToCompile.add(rootFile);
+        continue;
+      }
+
+      const {
+        artifactPaths,
+        buildInfoPath,
+        buildInfoOutputPath,
+        typeFilePath,
+      } = cacheResult;
+
+      for (const outputFilePath of [
+        ...artifactPaths,
+        buildInfoPath,
+        buildInfoOutputPath,
+        typeFilePath,
+      ]) {
+        if (!(await exists(outputFilePath))) {
+          rootFilesToCompile.add(rootFile);
+          break;
+        }
       }
     }
 
@@ -574,8 +591,9 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
   public async emitArtifacts(
     compilationJob: CompilationJob,
     compilerOutput: CompilerOutput,
-  ): Promise<ReadonlyMap<string, string[]>> {
-    const result = new Map<string, string[]>();
+  ): Promise<EmitArtifactsResult> {
+    const artifactsPerFile = new Map<string, string[]>();
+    const typeFilePaths = new Map<string, string>();
     const buildId = await compilationJob.getBuildId();
 
     const userSourceNameMap = Object.fromEntries(
@@ -635,12 +653,13 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
         }
       }
 
-      result.set(userSourceName, paths);
+      artifactsPerFile.set(userSourceName, paths);
 
       const artifactsDeclarationFilePath = path.join(
         fileFolder,
         "artifacts.d.ts",
       );
+      typeFilePaths.set(userSourceName, artifactsDeclarationFilePath);
       console.log(
         `Writing artifacts declaration file ${artifactsDeclarationFilePath}`,
       );
@@ -698,7 +717,12 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       })(),
     ]);
 
-    return result;
+    return {
+      artifactsPerFile,
+      buildInfoPath,
+      buildInfoOutputPath,
+      typeFilePaths,
+    };
   }
 
   public async cleanupArtifacts(rootFilePaths: string[]): Promise<void> {
@@ -871,27 +895,52 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
     return `${error.type}: ${error.message}`.replace(/[:\s]*$/g, "").trim();
   }
 
-  // TODO: Saving the compilation results in the cache, currently, involves stringifying
-  // the compilation output objects and writing them to disk. Such files are already
-  // created earlier in the build process by the Compiler. Instead of creating them
-  // again, we should consider copying/moving them to the cache.
-  #cacheCompilationResults(
-    compilationResults: CompilationResult[],
+  async #cacheCompilationResult(
+    indexedIndividualJobs: Map<string, CompilationJob>,
+    result: CompilationResult,
+    emitArtifactsResult: EmitArtifactsResult,
   ): Promise<void> {
-    // return Promise.all(
-    // compilationResults.map(async (result) => {
-    //   console.log(
-    //     `Caching compiler output for build ${await result.compilationJob.getBuildId()}`,
-    //   );
+    const rootFilePaths = result.compilationJob.dependencyGraph
+      .getRoots()
+      .keys();
 
-    //   return this.#compilerOutputCache.set(
-    //     await result.compilationJob.getBuildId(),
-    //     result.compilerOutput,
-    //   );
-    // }),
-    // ).then(() => {
-    return this.#compilerOutputCache.clean();
-    // });
+    await Promise.all(
+      rootFilePaths.map(async (rootFilePath) => {
+        const individualJob = indexedIndividualJobs.get(rootFilePath);
+
+        assertHardhatInvariant(
+          individualJob !== undefined,
+          "Failed to get individual job from compiled job",
+        );
+
+        const artifactPaths =
+          emitArtifactsResult.artifactsPerFile.get(rootFilePath);
+
+        assertHardhatInvariant(
+          artifactPaths !== undefined,
+          `No artifacts found on map for ${rootFilePath}`,
+        );
+
+        const typeFilePath =
+          emitArtifactsResult.typeFilePaths.get(rootFilePath);
+
+        assertHardhatInvariant(
+          typeFilePath !== undefined,
+          `No type file found on map for ${rootFilePath}`,
+        );
+
+        const key = `${rootFilePath}-${await individualJob.getBuildId()}`;
+
+        console.log(`Setting ${key}`);
+
+        return this.#compilerOutputCache.set(key, {
+          artifactPaths,
+          buildInfoPath: emitArtifactsResult.buildInfoPath,
+          buildInfoOutputPath: emitArtifactsResult.buildInfoOutputPath,
+          typeFilePath,
+        });
+      }),
+    );
   }
 
   #printSolcErrorsAndWarnings(errors?: CompilerOutputError[]): void {
