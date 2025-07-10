@@ -8,6 +8,7 @@ import {
   readJsonFile,
 } from "@nomicfoundation/hardhat-utils/fs";
 import { BuildInfo } from "../../../../../../src/types/artifacts.js";
+import assert from "node:assert";
 
 export async function getHRE(
   project: TestProject,
@@ -225,4 +226,15 @@ export class TestProjectWrapper {
 
     return buildInfo;
   }
+}
+
+export function assertFileCounts(
+  snapshot: Snapshot,
+  buildInfoCount: number,
+  artifactCount: number,
+  typefileCount: number,
+): void {
+  assert.equal(snapshot.buildInfos.length, buildInfoCount);
+  assert.equal(Object.entries(snapshot.typeFiles).length, typefileCount);
+  assert.equal(Object.values(snapshot.artifacts).flat().length, artifactCount);
 }

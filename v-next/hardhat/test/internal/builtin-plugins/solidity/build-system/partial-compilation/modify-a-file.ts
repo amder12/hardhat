@@ -6,7 +6,7 @@ import { getHRE, TestProjectWrapper } from "./helpers.js";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 
-describe.only("Partial compilation", () => {
+describe("Partial compilation", () => {
   describe("modify a file in a one-file project", () => {
     it("should delete old build info, create a new one, update artifacts and typefile", async () => {
       await using _project = await useTestProjectTemplate({
