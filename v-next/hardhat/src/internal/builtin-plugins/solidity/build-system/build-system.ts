@@ -59,7 +59,6 @@ import {
   getContractArtifact,
   getDuplicatedContractNamesDeclarationFile,
 } from "./artifacts.js";
-import { ObjectCache } from "./cache.js";
 import { CompilationJobImplementation } from "./compilation-job.js";
 import { downloadConfiguredCompilers, getCompiler } from "./compiler/index.js";
 import { buildDependencyGraph } from "./dependency-graph-building.js";
@@ -71,6 +70,12 @@ import {
   parseRootPath,
 } from "./root-paths-utils.js";
 import { SolcConfigSelector } from "./solc-config-selection.js";
+import {
+  CompileCache,
+  getCacheFilepath,
+  loadCache,
+  saveCache,
+} from "./cache.js";
 
 const log = debug("hardhat:core:solidity:build-system");
 
@@ -88,24 +93,18 @@ export interface SolidityBuildSystemOptions {
   readonly cachePath: string;
 }
 
-export interface RootFileCacheEntry {
-  buildInfoPath: string;
-  buildInfoOutputPath: string;
-  artifactPaths: string[];
-  typeFilePath: string;
-}
-
 export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
   readonly #hooks: HookManager;
   readonly #options: SolidityBuildSystemOptions;
-  readonly #compilerOutputCache: ObjectCache<RootFileCacheEntry>;
+  readonly #compileCachePath: string;
+  #compileCache: CompileCache = {};
   readonly #defaultConcurrency = Math.max(os.cpus().length - 1, 1);
   #downloadedCompilers = false;
 
   constructor(hooks: HookManager, options: SolidityBuildSystemOptions) {
     this.#hooks = hooks;
     this.#options = options;
-    this.#compilerOutputCache = new ObjectCache<RootFileCacheEntry>(
+    this.#compileCachePath = getCacheFilepath(
       options.cachePath,
       "compiler-output",
       "v2",
@@ -250,7 +249,7 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
         }),
       );
 
-      await this.#compilerOutputCache.clean();
+      await saveCache(this.#compileCachePath, this.#compileCache);
     }
 
     const resultsMap: Map<string, FileBuildResult> = new Map();
@@ -418,18 +417,23 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       }),
     );
 
+    // Load the cache
+    this.#compileCache = await loadCache(this.#compileCachePath);
+
     // Select which files to compile
     const rootFilesToCompile: Set<string> = new Set();
 
     for (const [rootFile, compilationJob] of indexedIndividualJobs.entries()) {
-      const cacheKey = `${rootFile}-${await compilationJob.getBuildId()}`;
-      const cacheResult = await this.#compilerOutputCache.get(cacheKey);
+      const jobHash = await compilationJob.getBuildId();
+      const cacheResult = this.#compileCache[rootFile];
 
-      if (cacheResult === undefined) {
+      // If there's no cache for the root file, or the compilation job changed, compile it
+      if (cacheResult === undefined || cacheResult.jobHash !== jobHash) {
         rootFilesToCompile.add(rootFile);
         continue;
       }
 
+      // If any of the emitted files are not present anymore, compile it
       const {
         artifactPaths,
         buildInfoPath,
@@ -904,43 +908,41 @@ export class SolidityBuildSystemImplementation implements SolidityBuildSystem {
       .getRoots()
       .keys();
 
-    await Promise.all(
-      rootFilePaths.map(async (rootFilePath) => {
-        const individualJob = indexedIndividualJobs.get(rootFilePath);
+    for (const rootFilePath of rootFilePaths) {
+      const individualJob = indexedIndividualJobs.get(rootFilePath);
 
-        assertHardhatInvariant(
-          individualJob !== undefined,
-          "Failed to get individual job from compiled job",
-        );
+      assertHardhatInvariant(
+        individualJob !== undefined,
+        "Failed to get individual job from compiled job",
+      );
 
-        const artifactPaths =
-          emitArtifactsResult.artifactsPerFile.get(rootFilePath);
+      const artifactPaths =
+        emitArtifactsResult.artifactsPerFile.get(rootFilePath);
 
-        assertHardhatInvariant(
-          artifactPaths !== undefined,
-          `No artifacts found on map for ${rootFilePath}`,
-        );
+      assertHardhatInvariant(
+        artifactPaths !== undefined,
+        `No artifacts found on map for ${rootFilePath}`,
+      );
 
-        const typeFilePath =
-          emitArtifactsResult.typeFilePaths.get(rootFilePath);
+      const typeFilePath = emitArtifactsResult.typeFilePaths.get(rootFilePath);
 
-        assertHardhatInvariant(
-          typeFilePath !== undefined,
-          `No type file found on map for ${rootFilePath}`,
-        );
+      assertHardhatInvariant(
+        typeFilePath !== undefined,
+        `No type file found on map for ${rootFilePath}`,
+      );
 
-        const key = `${rootFilePath}-${await individualJob.getBuildId()}`;
+      const jobHash = await individualJob.getBuildId();
 
-        console.log(`Setting ${key}`);
+      console.log(`Setting ${rootFilePath}`);
 
-        return this.#compilerOutputCache.set(key, {
-          artifactPaths,
-          buildInfoPath: emitArtifactsResult.buildInfoPath,
-          buildInfoOutputPath: emitArtifactsResult.buildInfoOutputPath,
-          typeFilePath,
-        });
-      }),
-    );
+      this.#compileCache[rootFilePath] = {
+        jobHash,
+        artifactPaths,
+        buildInfoPath: emitArtifactsResult.buildInfoPath,
+        buildInfoOutputPath: emitArtifactsResult.buildInfoOutputPath,
+        typeFilePath,
+      };
+    }
   }
 
   #printSolcErrorsAndWarnings(errors?: CompilerOutputError[]): void {

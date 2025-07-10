@@ -7,7 +7,7 @@ import { rename, rm } from "node:fs/promises";
 import { basename } from "node:path";
 import { createHardhatRuntimeEnvironment } from "../../../../../../src/hre.js";
 
-describe.only("Partial compilation", () => {
+describe("Partial compilation", () => {
   describe("changing solc config", () => {
     it("should recompile the files that are affected by the config change", async () => {
       await using _project = await useTestProjectTemplate({
