@@ -3,7 +3,11 @@ import { createHardhatRuntimeEnvironment } from "../../../../../../src/internal/
 import { HardhatRuntimeEnvironment } from "../../../../../../src/types/hre.js";
 import { TestProject } from "../resolver/helpers.js";
 import { readdir, readFile, stat } from "fs/promises";
-import { getAllFilesMatching } from "@nomicfoundation/hardhat-utils/fs";
+import {
+  getAllFilesMatching,
+  readJsonFile,
+} from "@nomicfoundation/hardhat-utils/fs";
+import { BuildInfo } from "../../../../../../src/types/artifacts.js";
 
 export async function getHRE(
   project: TestProject,
@@ -16,6 +20,25 @@ export interface FileDetail {
   modificationTime: Date;
 }
 
+interface BuildInfoDetail {
+  path: string;
+  modificationTime: any;
+  buildId: string;
+  sources: string[];
+}
+
+interface Snapshot {
+  buildInfos: BuildInfoDetail[];
+  buildInfoOutputs: {
+    path: string;
+    modificationTime: any;
+    buildId: string;
+  }[];
+  artifacts: Record<string, FileDetail[]>;
+  typeFiles: Record<string, FileDetail>;
+  buildIdReferences: Record<string, string>;
+}
+
 export class TestProjectWrapper {
   constructor(
     public project: TestProject,
@@ -26,21 +49,7 @@ export class TestProjectWrapper {
     await this.hre.tasks.getTask(["compile"]).run({ ...options, quiet: true });
   }
 
-  async getSnapshot(): Promise<{
-    buildInfos: {
-      path: string;
-      modificationTime: any;
-      buildId: string;
-    }[];
-    buildInfoOutputs: {
-      path: string;
-      modificationTime: any;
-      buildId: string;
-    }[];
-    artifacts: Record<string, FileDetail[]>;
-    typeFiles: Record<string, FileDetail>;
-    buildIdReferences: Record<string, string>;
-  }> {
+  async getSnapshot(): Promise<Snapshot> {
     const buildInfos = await this.getBuildInfoFiles();
     const buildInfoOutputs = await this.getBuildInfoOutputFiles();
     const artifacts = await this.getArtifacts();
@@ -71,6 +80,7 @@ export class TestProjectWrapper {
       path: string;
       modificationTime: any;
       buildId: string;
+      sources: string[];
     }[]
   > {
     const filePaths = (await readdir(this.buildInfosBasePath()))
@@ -78,11 +88,20 @@ export class TestProjectWrapper {
       .map((basename) => path.join(this.buildInfosBasePath(), basename));
 
     return Promise.all(
-      filePaths.map(async (filePath) => ({
-        path: filePath,
-        modificationTime: await this.getModificationTime(filePath),
-        buildId: path.basename(filePath).replace(".json", ""),
-      })),
+      filePaths.map(async (filePath) => {
+        const modificationTime = await this.getModificationTime(filePath);
+        const buildId = path.basename(filePath).replace(".json", "");
+        const sources = Object.keys(
+          ((await readJsonFile(filePath)) as BuildInfo).input.sources,
+        ).map((sourceName) => sourceName.replace("project/contracts/", ""));
+
+        return {
+          path: filePath,
+          modificationTime,
+          buildId,
+          sources,
+        };
+      }),
     );
   }
 
@@ -178,5 +197,32 @@ export class TestProjectWrapper {
     return artifactPath
       .replace(`${this.artifactsBasePath() + path.sep}`, "")
       .replace(`${path.sep + path.basename(artifactPath)}`, "");
+  }
+
+  getBuildInfoForSourceFile(
+    snapshot: Snapshot,
+    source: string,
+  ): BuildInfoDetail {
+    const artifacts = snapshot.artifacts[source];
+
+    if (artifacts === undefined || artifacts.length === 0) {
+      throw new Error(`No artifacts on snapshot for source ${source}`);
+    }
+
+    const buildInfoId = snapshot.buildIdReferences[artifacts[0].path];
+
+    if (buildInfoId === undefined) {
+      throw new Error(`No build info reference for ${artifacts[0].path}`);
+    }
+
+    const buildInfo = snapshot.buildInfos.find(
+      (bi) => bi.buildId === buildInfoId,
+    );
+
+    if (buildInfo === undefined) {
+      throw new Error(`Couldnt find build info with id ${buildInfoId}`);
+    }
+
+    return buildInfo;
   }
 }

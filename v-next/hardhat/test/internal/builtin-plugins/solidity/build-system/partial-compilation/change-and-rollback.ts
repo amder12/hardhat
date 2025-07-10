@@ -11,7 +11,7 @@ import { createHardhatRuntimeEnvironment } from "../../../../../../src/hre.js";
 // changing it again to the previous content and recompiling. the artifacts/build info should be
 // the first version, not the second one. It's used to ensure the cache is not flaky
 // It's important that there's a second unchanged file so the first build info is not deleted
-describe.only("Partial compilation", () => {
+describe("Partial compilation", () => {
   describe("changing a file and rolling it back", () => {
     it("should output the correct build info and artifacts", async () => {
       await using _project = await useTestProjectTemplate({
